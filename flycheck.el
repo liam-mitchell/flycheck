@@ -47,6 +47,7 @@
   (require 'pcase)          ; `pcase-dolist' (`pcase' itself is autoloaded)
   )
 
+(require 'json)
 (require 'dash)
 
 (require 'subr-x nil 'no-error)  ; Additional utilities, Emacs 24.4 and upwards
@@ -4256,6 +4257,8 @@ symbols in the command."
           ;;
           ;; See https://github.com/flycheck/flycheck/issues/298 for an
           ;; example for such a conflict.
+          (when (not (null(get checker 'flycheck-directory)))
+            (cd (get checker 'flycheck-directory)))
           (setq process (apply 'start-process (format "flycheck-%s" checker)
                                nil program args))
           (set-process-sentinel process 'flycheck-handle-signal)
@@ -4556,67 +4559,6 @@ directory, or nil otherwise."
       '(flycheck-locate-config-file-absolute-path
         flycheck-locate-config-file-ancestor-directories
         flycheck-locate-config-file-home))
-
-(defun flycheck-json-value (object key)
-  "Retrieves the value specified by KEY from OBJECT.
-
-OBJECT must be a list in the form read by json-read-file from a JSON
- compiler commands database."
-  (let ((pair (car object)))
-    (cond ((eq (car pair) key) (cdr pair))
-          ('t (flycheck-json-value (cdr object) key)))))
-
-(defun flycheck-json-command-p (object)
-  "Determine whether OBJECT is a valid compiler command for the current buffer.
-
-OBJECT must be a list of pairs, retrieved from a compilation database.
- This function simply checks if the file specified by the 'file' field matches
- the filename of the current buffer."
-  (string= (flycheck-json-value object 'file) buffer-file-name))
-
-(defun flycheck-find-json-command (objects)
-  "Find the compiler command used for the current buffer in OBJECTS.
-
-OBJECTS must be a list of compiler commands read from a compilation database."
-  (let ((commands (cl-remove-if-not 'flycheck-json-command-p objects)))
-    (if (or (= (length commands) 0) (> (length commands) 1))
-        nil
-      (aref commands 0))))
-
-(defun flycheck-json-command (file)
-  "Read the compiler command for the current buffer from FILE.
-
-FILE must be a JSON compiler commands database."
-  (let ((objects (json-read-file file)))
-    (if (or (null objects) (= (length objects) 0))
-        (error (concat file " is not a valid compilation database!"))
-      (let ((command (flycheck-find-json-command objects)))
-        (if (null command)
-            (error "%s %s %s"
-                   "Unable to find captured compilation command for"
-                   "the current buffer in compilation database"
-                   file)
-          command)))))
-
-;; (defun flycheck-set-command (command)
-;;   "Set the syntax checker command for the current buffer to COMMAND."
-;;   (put (flycheck-get-checker-for-buffer) 'flycheck-command command))
-
-(defun flycheck-read-command (file)
-  "Read the command for the current buffer from compilation database FILE.
-
-Stores the command as the command for the current flycheck checker (as
- specified by `flycheck-get-checker-for-buffer'), effectively using that
- compiler command for syntax checking of the current file."
-  (let* ((json-object (flycheck-json-command file))
-         (command (split-string-and-unquote (flycheck-json-value json-object 'command))))
-    (if (null command)
-        (error "%s %s %s %s"
-               "Unable to read compiler command for"
-               (buffer-file-name)
-               "from compilation database"
-               file)
-      command)))
 
 ;;;###autoload
 (defmacro flycheck-def-option-var (symbol init-value checker docstring
@@ -7499,13 +7441,20 @@ See URL `http://www.ruby-doc.org/stdlib-2.0.0/libdoc/yaml/rdoc/YAML.html'."
   :modes yaml-mode)
 
 (flycheck-def-option-var flycheck-automatic-command-file nil automatic
-  "A file containing compiler commands to use for automatic syntax checking."
+  "A file containing compiler commands to use for automatic syntax checking.
+
+The file must be formatted as a JSON compilation database
+ (see http://clang.llvm.org/docs/JSONCompilationDatabase.html).  If your project
+ uses CMake, you can generate this database with the CMake option
+ CMAKE_EXPORT_COMPILER_COMMANDS.  For other Linux-based projects, you can
+ use bear (https://github.com/rizsotto/bear).
+
+The commands are parsed into alists with the format
+  ((command . \"<compiler command line>\")
+   (directory . \"</cwd/of/command>\")
+   (file . \"<file compiled by command>\"))"
   :type 'string
   :safe #'file-exists-p)
-
-;; (flycheck-define-checker automatic
-;;   :command ("echo" "Flycheck error - no automatic syntax checker defined")
-;;   :error-patterns ("echo" "Flycheck error - no automatic syntax checker defined"))
 
 (flycheck-define-checker automatic
   "Automatically detect syntax checker settings from file.
@@ -7515,46 +7464,115 @@ Uses FLYCHECK-AUTOMATIC-COMMAND-FILE to determine the compiler command used for
  FLYCHECK-AUTOMATIC-ARGS to the command. Attempts to detect error patterns based
  on the detected command."
   :command ("echo" "Flycheck error - no automatic syntax checker defined")
-  :error-patterns
-  (("echo" "Flycheck error - no automatic syntax checker defined")))
+  :error-patterns (("echo" "Flycheck error - no automatic syntax checker defined")))
 
-;; (defun flycheck-checker-matches (checker executable)
-;;   (string-match-p (concat ".*" (flycheck-checker-executable checker) "$")
-;;                   executable))
+(defvar flycheck-checker-syntax-args (make-hash-table))
+(puthash 'c/c++-clang "-fsyntax-only" flycheck-checker-syntax-args)
+(puthash 'c/c++-gcc "-fsyntax-only" flycheck-checker-syntax-args)
+(puthash 'c/c++-cl "/Z" flycheck-checker-syntax-args)
 
-(defun flycheck-command-matches (command checker)
-  (string-match-p (regexp-quote (file-name-nondirectory command))
-                  (file-name-nondirectory (flycheck-checker-executable checker))))
+(defvar flycheck-checker-executable-regexps (make-hash-table))
+(puthash 'c/c++-gcc "\\(g\\+\\+\\|gcc\\)" flycheck-checker-executable-regexps)
+(puthash 'c/c++-clang "clang" flycheck-checker-executable-regexps)
+(puthash 'c/c++-cl "cl" flycheck-checker-executable-regexps)
 
-(defun flycheck-read-checker (command)
-  (let ((checkers (cl-remove-if-not (lambda (x) (flycheck-command-matches command x))
+(defun flycheck-command-p (alist)
+  "Determine whether ALIST is a valid compiler command for the current buffer.
+
+ALIST must be an alist as read from a compilation database (see
+ `flycheck-automatic-command-file' documentation for details)."
+  (string= (cdr (assoc 'file alist)) buffer-file-name))
+
+(defun flycheck-find-command (alists)
+  "Find the compiler command used for the current buffer in ALISTS.
+
+ALISTS must be a list of alists as read from a compilation database (see
+ `flycheck-automatic-command-file' documentation for details)."
+  (let ((commands (cl-remove-if-not 'flycheck-command-p alists)))
+    (if (not (= (length commands) 1))
+        nil
+      (aref commands 0))))
+
+(defun flycheck-read-command (file)
+  "Read the compiler command for the current buffer from FILE.
+
+FILE must be a JSON compilation database (see `flycheck-automatic-command-file'
+ documentation for details)."
+  (let ((objects (json-read-file file)))
+    (if (or (null objects) (= (length objects) 0))
+        (error "%s %s" file "is not a valid compilation database!")
+      (let ((command (flycheck-find-command objects)))
+        (if (null command)
+            (error "%s %s %s"
+                   "Unable to find captured compilation command for"
+                   "the current buffer in compilation database"
+                   file)
+          command)))))
+
+(defun flycheck-checker-command-p (command checker)
+  "Determine whether COMMAND uses the same executable as CHECKER.
+
+Matches against FLYCHECK-CHECKER-EXECUTABLE-REGEXPS to determine a match."
+  (let ((regexp (gethash checker flycheck-checker-executable-regexps)))
+    (if (not (null regexp))
+        (string-match-p (gethash checker flycheck-checker-executable-regexps)
+                        (file-name-nondirectory command))
+      nil)))
+
+(defun flycheck-find-checker (command)
+  "Determine the checker for COMMAND.
+
+COMMAND is a list of command line arguments."
+  (let ((checkers (cl-remove-if-not (lambda (x) (flycheck-checker-command-p command x))
                                     flycheck-checkers)))
     (if (not (= (length checkers) 1))
-        (error "Unable to detect error patterns - found %d possible matches."
+        (error "Unable to detect checker - found %d possible matches."
                (length checkers))
       (car checkers))))
 
-;; (defun flycheck-read-error-patterns (checker)
-;;   (let ((checkers (cl-remove-if-not (lambda (x)
-;;                                       (flycheck-checker-matches checker x))
-;;                                     (mapcar #'flycheck-checker-executable flycheck-checkers))))
-;;     (if (not (= (length checkers) 1))
-;;         (error "Unable to detect error patterns - found %d possible matches."
-;;                (length checkers))
-;;       (get (car checkers) 'flycheck-error-patterns))))
-
 (defun flycheck-automatic-load ()
-  (let* ((command (flycheck-read-command flycheck-automatic-command-file))
-         (checker (flycheck-read-checker (car command))))
-    (put 'automatic 'flycheck-command command)
-    (put 'automatic 'flycheck-error-patterns (get checker 'flycheck-error-patterns))))
+  "Load syntax checker settings for the `automatic' syntax checker.
 
-  ;; (put 'automatic
-  ;;      'flycheck-command
-  ;;      (flycheck-read-command flycheck-automatic-command-file))
-  ;; (put 'automatic
-  ;;      'flycheck-error-patterns
-  ;;      (flycheck-read-error-patterns 'automatic)))
+Uses FLYCHECK-AUTOMATIC-COMMAND-FILE to detect the command for the current
+ buffer, appending the appropriate value from FLYCHECK-CHECKER-SYNTAX-ARGS
+ to the command (if any exists) in order to cause the compiler to perform
+ a syntax checking compilation instead of a full one (eg. '-fsyntax-only'
+ for gcc).
+
+Also sets `flycheck-directory' for `automatic' to the directory detected in
+ the command file, so that flycheck can issue the compiler command from the
+ correct directory.
+
+Finally, gathers error patterns for `automatic' by matching the executable from
+ the compiler command (eg. the final pathname component from the first argument)
+ against FLYCHECK-CHECKER-EXECUTABLE-REGEXPS to determine the error patterns
+ for the checker we're actually using."
+
+  ;; Make sure we have a file to load from
+  (when (null flycheck-automatic-command-file)
+    (error "[%s] %s"
+           "flycheck-automatic-load"
+           "`flycheck-automatic-command-file' undefined!"))
+
+  ;; Read the command from `flycheck-automatic-command-file', then extract
+  ;;  command line, directory, and error patterns appropriately.
+  (let* ((alist (flycheck-read-command flycheck-automatic-command-file))
+         (command (split-string-and-unquote (cdr (assoc 'command alist))))
+         (directory (cdr (assoc 'directory alist)))
+
+         ;; Find a checker to steal error patterns from
+         (checker (flycheck-find-checker (car command)))
+
+         ;; Find a 'syntax-only' argument to append
+         (syntax-arg (gethash checker flycheck-checker-syntax-args)))
+
+    ;; If we have a 'syntax-only' argument, append it to the command
+    (unless (null syntax-arg) (setq command (append command (cons syntax-arg nil))))
+
+    ;; Set variables for `automatic'
+    (put 'automatic 'flycheck-command command)
+    (put 'automatic 'flycheck-error-patterns (get checker 'flycheck-error-patterns))
+    (put 'automatic 'flycheck-directory directory)))
 
 (provide 'flycheck)
 
