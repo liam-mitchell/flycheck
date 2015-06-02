@@ -7476,12 +7476,19 @@ Uses FLYCHECK-AUTOMATIC-COMMAND-FILE to determine the compiler command used for
 (puthash 'c/c++-clang "clang" flycheck-checker-executable-regexps)
 (puthash 'c/c++-cl "cl" flycheck-checker-executable-regexps)
 
-(defun flycheck-command-p (alist)
-  "Determine whether ALIST is a valid compiler command for the current buffer.
+(defun flycheck-filename-regexp (filename)
+  "Create a regexp which matches FILENAME's C/C++ file if it is a C/C++ header."
+  (if (string-match-p "^\\(hh?\\|hpp\\)$" (file-name-extension filename))
+      (concat "^"
+              (file-name-sans-extension filename)
+              "\\.\\(cc?\\|cpp?\\|C\\|CPP\\|c++\\|cxx\\)$")
+    filename))
 
-ALIST must be an alist as read from a compilation database (see
- `flycheck-automatic-command-file' documentation for details)."
-  (string= (cdr (assoc 'file alist)) buffer-file-name))
+(defun flycheck-command-p (alist)
+  "Determine whether ALIST holds a valid compiler command for the current file."
+  (string-match-p
+   (flycheck-filename-regexp buffer-file-name)
+   (cdr (assoc 'file alist))))
 
 (defun flycheck-find-command (alists)
   "Find the compiler command used for the current buffer in ALISTS.
